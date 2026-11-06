@@ -588,12 +588,12 @@ class BufferedStreamExtractor:
         # Cache for action topic reorder permutations: {topic: np.ndarray}
         self._action_reorder_cache: Dict[str, np.ndarray] = {}
 
-        # Last known action position per robot ("" for single-arm, "left"/"right"
-        # for bimanual) — used to forward-fill action frames when an arm is
-        # disengaged (no new command published). Updated in
-        # _buffer_action_command() and is NOT evicted by the sliding buffer
-        # window, so a command published long ago can still be reused.
-        self._last_known_action: Dict[str, np.ndarray] = {}
+        # Newest command that has left the sliding buffer, per robot ("" for
+        # single-arm, "left"/"right" for bimanual), as (timestamp, position).
+        # Updated in _sync_joint_buffers(). Commands are read well ahead of the
+        # frame being aligned, so this is the only record of the past once an
+        # arm has been disengaged for longer than the buffer window.
+        self._evicted_action: Dict[str, Tuple[float, np.ndarray]] = {}
 
         # Per-robot, per-episode gap-fill counters, keyed by robot then by
         # one of "exact" | "hold_last" | "fallback_to_observation" | "dropped".
@@ -1085,17 +1085,22 @@ class BufferedStreamExtractor:
     ) -> Tuple[Optional[np.ndarray], str]:
         """
         Resolve the action position for one robot at target_ts, forward-filling
-        when the arm is disengaged (no live command in the sliding buffer).
+        when the arm is disengaged.
+
+        Only commands at or before target_ts are used. The buffer also holds
+        commands from the future (messages are read ahead of the frame being
+        aligned), and using one would label a frame with a command the robot
+        had not received yet.
 
         Fallback order:
-        1. Nearest command in the live buffer ("exact").
-        2. Last command ever published for this robot, regardless of how long
-           ago ("hold_last") — the arm physically holds its last commanded
-           position when idle, so this reflects reality.
+        1. Latest past command, if it is at most one frame old ("exact").
+        2. Latest past command, however old ("hold_last") — the arm physically
+           holds its last commanded position when idle, so this reflects
+           reality.
         3. The robot's current measured joint position from obs_data
-           ("fallback_to_observation") — used when the robot has never
-           published a command yet in this episode (e.g. an idle arm at the
-           very start of a recording).
+           ("fallback_to_observation") — used when the robot has not published
+           a command yet in this episode (e.g. an idle arm at the very start
+           of a recording).
         4. None ("dropped") — should not happen in practice since
            observation data is dense, but kept as a safety net.
 
@@ -1103,14 +1108,15 @@ class BufferedStreamExtractor:
             (position, fill_kind) where position is a copy of the resolved
             array, or None if fill_kind == "dropped".
         """
-        if buffer:
-            nearest_idx = self._find_nearest_in_buffer(buffer, target_ts)
-            _, pos, _, _ = buffer[nearest_idx]
-            return pos.copy(), "exact"
+        past = [item[:2] for item in buffer if item[0] <= target_ts]
+        evicted = self._evicted_action.get(robot)
+        if evicted is not None and evicted[0] <= target_ts:
+            past.append(evicted)
 
-        last_known = self._last_known_action.get(robot)
-        if last_known is not None:
-            return last_known.copy(), "hold_last"
+        if past:
+            ts, pos = max(past, key=lambda item: item[0])
+            fresh = target_ts - ts <= self.frame_interval
+            return pos.copy(), "exact" if fresh else "hold_last"
 
         if robot in obs_data:
             return obs_data[robot]["pos"].copy(), "fallback_to_observation"
@@ -1306,8 +1312,6 @@ class BufferedStreamExtractor:
         vel = np.array([], dtype=np.float32)
         eff = np.array([], dtype=np.float32)
 
-        self._last_known_action[robot] = pos.copy()
-
         # Append as tuple: (timestamp, position, velocity, effort)
         joint_buffers[key]["buffer"].append((timestamp, pos, vel, eff))
 
@@ -1320,15 +1324,20 @@ class BufferedStreamExtractor:
         Remove joint state samples older than the oldest camera frame.
 
         This keeps joint state buffers synchronized with camera buffer time window.
+        The newest removed command per robot is kept for hold-last filling.
 
         Args:
             joint_buffers: Joint state buffers to sync
             oldest_camera_ts: Timestamp of oldest remaining camera frame
         """
-        for key, data in joint_buffers.items():
+        for (role, robot), data in joint_buffers.items():
             buffer = data["buffer"]
             while buffer and buffer[0][0] < oldest_camera_ts:
-                buffer.popleft()
+                ts, pos, _, _ = buffer.popleft()
+                if role == "action":
+                    evicted = self._evicted_action.get(robot)
+                    if evicted is None or ts >= evicted[0]:
+                        self._evicted_action[robot] = (ts, pos)
 
     def _get_joint_names(
         self,

@@ -1,11 +1,11 @@
 """Tests for BufferedStreamExtractor's action gap-fill behavior.
 
 Verifies:
-1. _buffer_action_command() caches the last known action per robot, independent
-   of the sliding time-window buffer's eviction.
-2. _resolve_action_position()'s fallback chain: exact buffer match -> hold the
-   last known command -> fall back to the robot's measured observation
-   position -> give up (dropped).
+1. _sync_joint_buffers() remembers the newest command leaving the sliding
+   buffer, so hold-last still works after a long gap.
+2. _resolve_action_position()'s fallback chain, using past commands only: fresh
+   command -> hold the latest past command -> fall back to the robot's measured
+   observation position -> give up (dropped).
 3. _record_action_fill()/get_action_fill_stats() correctly count each fallback
    tier per robot.
 4. _align_joint_states() forward-fills action data through mid-episode and
@@ -64,12 +64,14 @@ class FakeFloat64MultiArrayMessage:
 
 
 # =============================================================================
-# _buffer_action_command
+# _sync_joint_buffers
 # =============================================================================
 
 
-class TestBufferActionCommand:
-    def test_updates_last_known_action(self):
+class TestEvictedAction:
+    def test_reading_a_command_does_not_count_as_past(self):
+        """A command is read before its frame is aligned, so reading it must not
+        make it available to earlier frames."""
         extractor = make_extractor()
         joint_buffers = {}
 
@@ -78,10 +80,28 @@ class TestBufferActionCommand:
             msg, "/follower_r_forward_position_controller/commands", joint_buffers
         )
 
-        assert "right" in extractor._last_known_action
-        np.testing.assert_array_equal(
-            extractor._last_known_action["right"], np.array([1.0, 2.0], dtype=np.float32)
-        )
+        assert extractor._evicted_action == {}
+
+    def test_remembers_newest_evicted_command(self):
+        extractor = make_extractor()
+        joint_buffers = {
+            ("action", "right"): {"buffer": _joint_buffer([(1.0, [1.0, 1.0]), (2.0, [2.0, 2.0])])},
+        }
+
+        extractor._sync_joint_buffers(joint_buffers, oldest_camera_ts=3.0)
+
+        assert not joint_buffers[("action", "right")]["buffer"]
+        ts, pos = extractor._evicted_action["right"]
+        assert ts == 2.0
+        np.testing.assert_array_equal(pos, np.array([2.0, 2.0], dtype=np.float32))
+
+    def test_ignores_evicted_observations(self):
+        extractor = make_extractor()
+        joint_buffers = {("observation", "right"): {"buffer": _joint_buffer([(1.0, [1.0, 1.0])])}}
+
+        extractor._sync_joint_buffers(joint_buffers, oldest_camera_ts=3.0)
+
+        assert extractor._evicted_action == {}
 
 
 # =============================================================================
@@ -99,9 +119,50 @@ class TestResolveActionPosition:
         np.testing.assert_array_equal(pos, np.array([1.0, 1.0], dtype=np.float32))
         assert fill_kind == "exact"
 
-    def test_holds_last_known_when_buffer_empty(self):
+    def test_uses_latest_past_command_not_nearest(self):
+        """The nearest command is in the future here; it must not be used."""
         extractor = make_extractor()
-        extractor._last_known_action["right"] = np.array([3.0, 4.0], dtype=np.float32)
+        buffer = _joint_buffer([(1.0, [1.0, 1.0]), (1.99, [2.0, 2.0]), (2.01, [3.0, 3.0])])
+
+        pos, fill_kind = extractor._resolve_action_position("left", buffer, 2.0, obs_data={})
+
+        np.testing.assert_array_equal(pos, np.array([2.0, 2.0], dtype=np.float32))
+        assert fill_kind == "exact"
+
+    def test_holds_past_command_through_a_gap(self):
+        """Mid-pause, the next command is already buffered. Hold the old one."""
+        extractor = make_extractor()
+        buffer = _joint_buffer([(1.0, [1.0, 1.0]), (3.0, [3.0, 3.0])])
+
+        pos, fill_kind = extractor._resolve_action_position("left", buffer, 2.9, obs_data={})
+
+        np.testing.assert_array_equal(pos, np.array([1.0, 1.0], dtype=np.float32))
+        assert fill_kind == "hold_last"
+
+    def test_only_future_commands_fall_back_to_observation(self):
+        """Before an arm's first command, its action must not jump to that command."""
+        extractor = make_extractor()
+        obs_data = {"left": {"pos": np.array([5.0, 6.0], dtype=np.float32), "vel": None, "eff": None}}
+        buffer = _joint_buffer([(3.0, [3.0, 3.0])])
+
+        pos, fill_kind = extractor._resolve_action_position("left", buffer, 1.0, obs_data)
+
+        np.testing.assert_array_equal(pos, np.array([5.0, 6.0], dtype=np.float32))
+        assert fill_kind == "fallback_to_observation"
+
+    def test_prefers_evicted_command_over_future_buffer(self):
+        extractor = make_extractor()
+        extractor._evicted_action["left"] = (1.0, np.array([1.0, 1.0], dtype=np.float32))
+        buffer = _joint_buffer([(3.0, [3.0, 3.0])])
+
+        pos, fill_kind = extractor._resolve_action_position("left", buffer, 2.0, obs_data={})
+
+        np.testing.assert_array_equal(pos, np.array([1.0, 1.0], dtype=np.float32))
+        assert fill_kind == "hold_last"
+
+    def test_holds_evicted_command_when_buffer_empty(self):
+        extractor = make_extractor()
+        extractor._evicted_action["right"] = (7.0, np.array([3.0, 4.0], dtype=np.float32))
 
         pos, fill_kind = extractor._resolve_action_position(
             "right", deque(), 12.0, obs_data={}
@@ -131,7 +192,7 @@ class TestResolveActionPosition:
         """When all three sources are available, the live buffer must win —
         it's the most current information, not just the first branch checked."""
         extractor = make_extractor()
-        extractor._last_known_action["right"] = np.array([9.0, 9.0], dtype=np.float32)
+        extractor._evicted_action["right"] = (0.5, np.array([9.0, 9.0], dtype=np.float32))
         obs_data = {"right": {"pos": np.array([0.0, 0.0], dtype=np.float32), "vel": None, "eff": None}}
         buffer = _joint_buffer([(1.0, [1.0, 1.0])])
 
@@ -146,11 +207,11 @@ class TestResolveActionPosition:
         mutation instead of the original recorded value."""
         extractor = make_extractor()
 
-        last_known = np.array([3.0, 4.0], dtype=np.float32)
-        extractor._last_known_action["right"] = last_known
+        evicted = np.array([3.0, 4.0], dtype=np.float32)
+        extractor._evicted_action["right"] = (0.5, evicted)
         hold_last_pos, _ = extractor._resolve_action_position("right", deque(), 1.0, obs_data={})
         hold_last_pos[:] = -1.0
-        np.testing.assert_array_equal(extractor._last_known_action["right"], last_known)
+        np.testing.assert_array_equal(evicted, np.array([3.0, 4.0], dtype=np.float32))
 
         obs_pos = np.array([5.0, 6.0], dtype=np.float32)
         obs_data = {"left": {"pos": obs_pos, "vel": None, "eff": None}}
@@ -189,7 +250,7 @@ class TestAlignJointStatesActionFill:
         extractor = make_extractor()
         # Right arm published once at t=7.0 then went idle (disengaged) — its
         # buffer has been evicted by the time we're aligning t=12.0.
-        extractor._last_known_action["right"] = np.array([9.0, 9.0], dtype=np.float32)
+        extractor._evicted_action["right"] = (7.0, np.array([9.0, 9.0], dtype=np.float32))
 
         joint_buffers = {
             ("observation", "left"): {"buffer": _joint_buffer([(12.0, [1.0, 1.0])])},
@@ -211,7 +272,7 @@ class TestAlignJointStatesActionFill:
     def test_falls_back_to_observation_at_episode_start(self):
         """Reproduces the head-of-episode gap: right arm never engaged yet."""
         extractor = make_extractor()
-        # No entry in _last_known_action["right"] — it has never published.
+        # No entry in _evicted_action["right"] — it has never published.
 
         joint_buffers = {
             ("observation", "left"): {"buffer": _joint_buffer([(0.5, [1.0, 1.0])])},
