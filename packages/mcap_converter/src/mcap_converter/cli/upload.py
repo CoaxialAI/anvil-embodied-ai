@@ -31,6 +31,11 @@ except ImportError as e:
     sys.exit(1)
 
 
+def allowed_namespaces(user_info: dict) -> set[str]:
+    """Namespaces a user can upload to: their own and their organizations'."""
+    return {user_info["name"], *(org["name"] for org in user_info.get("orgs", []))}
+
+
 def upload_dataset(
     dataset_path: str,
     repo_id: str,
@@ -69,26 +74,13 @@ def upload_dataset(
             username = user_info["name"]
             print(f"[OK] Logged in as: {username}")
 
-            # Validate repo_id namespace matches user
+            # Validate repo_id namespace: the user's own, or one of their organizations
             repo_namespace = repo_id.split("/")[0] if "/" in repo_id else username
-            if repo_namespace != username:
-                print("\n[WARNING] WARNING: Repository namespace mismatch!")
-                print(f"  Logged in user: {username}")
-                print(f"  Repo namespace: {repo_namespace}")
-                print(f"\nYou can only upload to your own namespace: {username}/...")
-
-                # Suggest correct repo_id
-                dataset_name = repo_id.split("/")[-1]
-                suggested_repo_id = f"{username}/{dataset_name}"
-                print(f"\nSuggested repo_id: {suggested_repo_id}")
-
-                response = input(f"\nUse {suggested_repo_id} instead? [Y/n]: ")
-                if response.lower() != "n":
-                    repo_id = suggested_repo_id
-                    print(f"[OK] Using: {repo_id}")
-                else:
-                    print("Upload cancelled")
-                    return False
+            allowed = allowed_namespaces(user_info)
+            if repo_namespace not in allowed:
+                print(f"\n[ERROR] Can't upload to namespace: {repo_namespace}")
+                print(f"  You can upload to: {', '.join(sorted(allowed))}")
+                return False
 
         except Exception as e:
             print("\n[ERROR] Not logged in to Hugging Face")
