@@ -143,11 +143,7 @@ def upload_dataset(
         print("\n[5/5] Uploading dataset to Hugging Face Hub...")
         print("This may take several minutes depending on dataset size...")
 
-        dataset.push_to_hub(
-            repo_id=repo_id,
-            token=True,
-            private=private,
-        )
+        dataset.push_to_hub(private=private)  # uses the repo_id the dataset was loaded with
 
         print("\n" + "=" * 70)
         print("[OK] Dataset uploaded successfully!")
